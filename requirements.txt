@@ -1,8 +1,8 @@
 #AI
-torch-directml==0.1.13.1.dev230301
+torch-directml
 
 #GUI
-customtkinter
+PySide6
 win32mica
 
 #UTILS
