@@ -4,6 +4,7 @@
     <a href="https://github.com/CrossDarkrix/QualityScaler-PySide6/releases">
 	Download
     </a>
+	<img width="316" height="333" alt="Preview" src="https://github.com/user-attachments/assets/afb89119-fc6f-4df4-a008-8452c5569632" />
 </div>
 
 ## What do you think of this repository.
