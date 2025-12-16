@@ -1,6 +1,7 @@
 import concurrent.futures
 import functools
 import itertools
+import io
 import os
 import pathlib
 import platform
@@ -8,7 +9,9 @@ import shutil
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
+import zipfile
 from math import sqrt
 from multiprocessing.pool import ThreadPool
 from timeit import default_timer as timer
@@ -71,6 +74,24 @@ option_y_5       = option_y_4 + offset_y_options
 option_y_6       = option_y_5 + offset_y_options
 
 transparent_color = "#080808"
+
+class initAIModel(object):
+    def __init__(self):
+        self.current_path = os.getcwd()
+        self.url = 'https://github.com/CrossDarkrix/QualityScaler-PySide6/releases/download/2.2/AIModel.zip'
+        self.url2 = 'https://github.com/CrossDarkrix/QualityScaler-PySide6/releases/download/2.2/AIModel2.zip'
+        self.urls = [self.url, self.url2]
+        self.user_agent = 'Mozilla/5.0 (Linux; U; Android 8.0; en-la; Nexus Build/JPG991) AppleWebKit/511.2 (KHTML, like Gecko) Version/5.0 Mobile/11S444 YJApp-ANDROID jp.co.yahoo.android.yjtop/4.01.1.5'
+        os.makedirs(os.path.join(os.getcwd(), 'AI'), exist_ok=True)
+
+    def start_Download(self):
+        def _unzip(download_file):
+            with zipfile.ZipFile(io.BytesIO(download_file)) as z:
+                z.extractall(os.path.join(self.current_path, 'AI'))
+        os.chdir(os.path.join(self.current_path, 'AI'))
+        [_unzip(download_file) for download_file in [urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': self.user_agent})).read() for url in self.urls]]
+        os.makedirs(os.path.join(self.current_path, 'AI', 'done'), exist_ok=True)
+        os.chdir(self.current_path)
 
 def AI_enhance(model, img, backend, half_precision):
     img = img.astype(np.float32)
@@ -585,10 +606,19 @@ def resize_image(image_path, resize_factor, selected_output_file_extension):
 class QualityScaler(QMainWindow):
     def __init__(self):
         super(QualityScaler, self).__init__()
-        self.resize(589, 593)
         icon_path = os.path.join(os.getcwd(), 'Assets', 'icon.png')
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(QPixmap(QSize(96, 96)).fromImage(QImage(icon_path))))
+        self.resize(589, 593)
+        if not os.path.exists(os.path.join(os.getcwd(), 'AI')):
+            concurrent.futures.ThreadPoolExecutor().submit(initAIModel().start_Download)
+            QMessageBox.information(self, "Model Downloading....", "downloading Model data. Please Wait.....")
+            while not os.path.exists(os.path.join(os.getcwd(), 'AI', 'done')):
+                if os.path.exists(os.path.join(os.getcwd(), 'AI', 'done')):
+                    shutil.rmtree(os.path.join(os.getcwd(), 'AI', 'done'))
+                    break
+                else:
+                    time.sleep(1)
         self.item_list = QualityScaler_ListView(self)
         self.item_list.setGeometry(QRect(0, 0, 591, 301))
         self.clean = QPushButton(self)
