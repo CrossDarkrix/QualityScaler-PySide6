@@ -1,7 +1,7 @@
 import concurrent.futures
 import functools
-import itertools
 import io
+import itertools
 import os
 import pathlib
 import platform
@@ -25,7 +25,7 @@ import torch.nn.init as init
 import torch_directml
 from PIL import Image
 from PySide6.QtCore import (QCoreApplication, QMetaObject, QRect,
-                            QSize, Qt, Signal)
+                            QSize, Qt, Signal, Slot, QThread)
 from PySide6.QtGui import (QFont, QIcon,
                            QImage, QStandardItemModel,
                            QPixmap, QStandardItem)
@@ -65,15 +65,6 @@ windows_subversion   = int(platform.version().split('.')[2])
 gpus_found           = torch_directml.device_count()
 resize_algorithm     = cv2.INTER_AREA
 
-offset_y_options = 0.1125
-option_y_1       = 0.705
-option_y_2       = option_y_1 + offset_y_options
-option_y_3       = option_y_2 + offset_y_options
-option_y_4       = option_y_1
-option_y_5       = option_y_4 + offset_y_options
-option_y_6       = option_y_5 + offset_y_options
-
-transparent_color = "#080808"
 
 class initAIModel(object):
     def __init__(self):
@@ -602,6 +593,276 @@ def resize_image(image_path, resize_factor, selected_output_file_extension):
     image_write(new_image_path, resized_image)
     return new_image_path
 
+class Upscale(QThread):
+    text = Signal(str)
+    work_end_text = Signal(str)
+    def __init__(self, cpu_of_number_count,
+                 selected_AI_Model,
+                 files_path,
+                 selected_output_Format,
+                 vram_number,
+                 target_resize,
+                 parent=None):
+        super().__init__(parent)
+        self.cpu_of_number_count = cpu_of_number_count
+        self.selected_AI_Model = selected_AI_Model
+        self.upscale_factor = None
+        self.files_path = files_path
+        self.selected_output_Format = selected_output_Format
+        self.vram_number = vram_number
+        self.target_resize = target_resize
+        self.backend = None
+        self.task = None
+        self.task_signal = False
+
+    def upscale_orchestrator(self):
+        start = timer()
+        torch.set_num_threads(self.cpu_of_number_count)
+        if self.backend is not None and self.upscale_factor is not None:
+            try:
+                AI_model = prepare_model(self.selected_AI_Model, self.backend, half_precision, self.upscale_factor)
+                for index in range(len(self.files_path)):
+                    if self.task_signal:
+                        break
+                    self.text.emit("Upscaling " + str(index + 1) + "/" + str(len(self.files_path)))
+                    file_path = self.files_path[index]
+                    file_path = file_path.replace(os.path.dirname(self.files_path[index]), '{}_upscaled'.format(os.path.dirname(self.files_path[index])))
+                    os.makedirs('{}_upscaled'.format(os.path.dirname(self.files_path[index])), exist_ok=True)
+                    shutil.copy(self.files_path[index], '{}_upscaled'.format(os.path.dirname(self.files_path[index])))
+                    if check_if_file_is_video(file_path):
+                        self.upscale_video(file_path,
+                                      AI_model,
+                                      self.selected_AI_Model,
+                                      self.upscale_factor,
+                                      self.backend,
+                                      self.selected_output_Format,
+                                      self.vram_number,
+                                      self.target_resize,
+                                      self.cpu_of_number_count,
+                                      half_precision)
+                    else:
+                        self.upscale_image(file_path,
+                                      AI_model,
+                                      self.selected_AI_Model,
+                                      self.upscale_factor,
+                                      self.backend,
+                                      self.selected_output_Format,
+                                      self.vram_number,
+                                      self.target_resize,
+                                      self.cpu_of_number_count,
+                                      half_precision)
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+
+                self.text.emit("All files completed (" + str(round(timer() - start)) + " sec.)")
+                self.work_end_text.emit("UPSCALE")
+                time.sleep(4)
+                self.text.emit('Hi :)')
+            except Exception:
+                self.text.emit("All files completed (" + str(round(timer() - start)) + " sec.)")
+                self.work_end_text.emit("UPSCALE")
+                time.sleep(4)
+                self.text.emit('Hi :)')
+
+    def upscale_image(self, image_path,
+                      AI_model,
+                      selected_AI_model,
+                      upscale_factor,
+                      backend,
+                      selected_output_file_extension,
+                      tiles_resolution,
+                      resize_factor,
+                      cpu_number,
+                      half_precision):
+
+        # if image need resize before AI work
+        if resize_factor != 1:
+            image_path = resize_image(image_path,
+                                      resize_factor,
+                                      selected_output_file_extension)
+
+        result_path = prepare_output_image_filename(image_path, selected_AI_model, resize_factor,
+                                                    selected_output_file_extension)
+        self.upscale_image_and_save(image_path,
+                               AI_model,
+                               result_path,
+                               tiles_resolution,
+                               upscale_factor,
+                               backend,
+                               half_precision)
+
+        # if the image was sized before the AI work
+        if resize_factor != 1: remove_file(image_path)
+
+    def upscale_image_and_save(self, image,
+                               AI_model,
+                               result_path,
+                               tiles_resolution,
+                               upscale_factor,
+                               backend,
+                               half_precision):
+
+        need_tiles, n_tiles = self.image_need_tiles(image, tiles_resolution)
+        if need_tiles:
+            split_image(image_path=image,
+                        rows=n_tiles,
+                        cols=n_tiles,
+                        should_cleanup=False,
+                        output_dir=os.path.dirname(os.path.abspath(image)))
+
+            tiles_list = get_tiles_paths_after_split(image, n_tiles, n_tiles)
+
+            with torch.no_grad():
+                for tile in tiles_list:
+                    tile_adapted = image_read(tile, cv2.IMREAD_UNCHANGED)
+                    tile_upscaled = AI_enhance(AI_model, tile_adapted, backend, half_precision)
+                    image_write(tile, tile_upscaled)
+
+            reverse_split(paths_to_merge=tiles_list,
+                          rows=n_tiles,
+                          cols=n_tiles,
+                          image_path=result_path,
+                          should_cleanup=False)
+
+            self.delete_list_of_files(tiles_list)
+        else:
+            with torch.no_grad():
+                img_adapted = image_read(image, cv2.IMREAD_UNCHANGED)
+                img_upscaled = AI_enhance(AI_model, img_adapted, backend, half_precision)
+                image_write(result_path, img_upscaled)
+
+    def image_need_tiles(self, image, tiles_resolution):
+        img_tmp = image_read(image)
+        image_pixels = (img_tmp.shape[1] * img_tmp.shape[0])
+        tile_pixels = (tiles_resolution * tiles_resolution)
+
+        n_tiles = image_pixels / tile_pixels
+
+        if n_tiles <= 1:
+            return False, 0
+        else:
+            if (n_tiles % 2) != 0: n_tiles += 1
+            n_tiles = round(sqrt(n_tiles * multiplier_num_tiles))
+
+            return True, n_tiles
+
+    def delete_list_of_files(self, list_to_delete):
+        if len(list_to_delete) > 0:
+            for to_delete in list_to_delete:
+                if os.path.exists(to_delete):
+                    os.remove(to_delete)
+
+    def upscale_video(self, video_path,
+                      AI_model,
+                      selected_AI_model,
+                      upscale_factor,
+                      backend,
+                      selected_output_file_extension,
+                      tiles_resolution,
+                      resize_factor,
+                      cpu_number,
+                      half_precision):
+
+        create_temp_dir(app_name + "_temp")
+
+        self.text.emit("Extracting video frames")
+        frame_list = extract_frames_from_video(video_path)
+
+        if resize_factor != 1:
+            self.text.emit("Resizing video frames")
+            frame_list = resize_frame_list(frame_list,
+                                           resize_factor,
+                                           selected_output_file_extension,
+                                           cpu_number)
+
+        self.upscale_video_and_save(video_path,
+                               frame_list,
+                               AI_model,
+                               tiles_resolution,
+                               selected_AI_model,
+                               backend,
+                               resize_factor,
+                               selected_output_file_extension,
+                               half_precision,
+                               cpu_number)
+
+    def upscale_video_and_save(self, video_path,
+                               frame_list,
+                               AI_model,
+                               tiles_resolution,
+                               selected_AI_model,
+                               backend,
+                               resize_factor,
+                               selected_output_file_extension,
+                               half_precision,
+                               cpu_number):
+
+        self.text.emit("Upscaling video")
+        frames_upscaled_list = []
+        need_tiles, n_tiles = video_need_tiles(frame_list[0], tiles_resolution)
+
+        # Prepare upscaled frames file paths
+        for frame in frame_list:
+            result_path = prepare_output_image_filename(frame, selected_AI_model, resize_factor,
+                                                        selected_output_file_extension)
+            frames_upscaled_list.append(result_path)
+
+        if need_tiles:
+            self.text.emit("Tiling frames...")
+            tiles_to_upscale, list_of_tiles_list = split_frames_list_in_tiles(frame_list, n_tiles, cpu_number)
+            how_many_tiles = len(tiles_to_upscale)
+
+            for index in range(how_many_tiles):
+                self.upscale_tiles(tiles_to_upscale[index],
+                              AI_model,
+                              backend,
+                              half_precision)
+                if (index % 8) == 0: self.text.emit(
+                    "Upscaled tiles " + str(index + 1) + "/" + str(how_many_tiles))
+
+            self.text.emit("Reconstructing frames by tiles...")
+            reverse_split_multiple_frames(list_of_tiles_list, frames_upscaled_list, n_tiles, cpu_number)
+
+        else:
+            how_many_frames = len(frame_list)
+
+            for index in range(how_many_frames):
+                self.upscale_single_frame(frame_list[index],
+                                     AI_model,
+                                     frames_upscaled_list[index],
+                                     backend,
+                                     half_precision)
+                if (index % 8) == 0: self.text.emit(
+                    "Upscaled frames " + str(index + 1) + "/" + str(how_many_frames))
+
+        # Reconstruct the video with upscaled frames
+        self.text.emit("Processing upscaled video")
+        video_reconstruction_by_frames(video_path, frames_upscaled_list,
+                                       selected_AI_model,
+                                       resize_factor, cpu_number)
+
+    def upscale_tiles(self, tile, AI_model, backend, half_precision):
+        with torch.no_grad():
+            tile_adapted = image_read(tile, cv2.IMREAD_UNCHANGED)
+            tile_upscaled = AI_enhance(AI_model, tile_adapted, backend, half_precision)
+            image_write(tile, tile_upscaled)
+
+    def upscale_single_frame(self, frame, AI_model, result_path, backend, half_precision):
+        with torch.no_grad():
+            img_adapted = image_read(frame, cv2.IMREAD_UNCHANGED)
+            img_upscaled = AI_enhance(AI_model, img_adapted, backend, half_precision)
+            image_write(result_path, img_upscaled)
+
+    def _init(self, backend, upscale_factor):
+        self.backend = backend
+        self.upscale_factor = upscale_factor
+
+    def run(self):
+        p = concurrent.futures.ThreadPoolExecutor(os.cpu_count() * 999999999999999)
+        p.submit(self.upscale_orchestrator).result()
+
 
 class QualityScaler(QMainWindow):
     def __init__(self):
@@ -748,6 +1009,7 @@ class QualityScaler(QMainWindow):
         self.output_pull.currentIndexChanged.connect(self._setFormat)
         self.output_pull.addItems(file_extension_list)
         self.target_resize = 0
+        self.process = None
         self.retranslateUi(self)
 
         QMetaObject.connectSlotsByName(self)
@@ -767,6 +1029,16 @@ class QualityScaler(QMainWindow):
         self.work_number.setText(QCoreApplication.translate("QualityScaler", u"Hi :)", None))
         self.formats_text.setText(' - SUPPORTED FILES -\n\nIMAGES - jpg png tif bmp webp\nVIDEOS - mp4 webm mkv flv gif avi mov mpg qt 3gp')
     # retranslateUi
+
+    @Slot(str)
+    def setWorkText(self, text):
+        self.work_number.setText(text)
+
+    @Slot(str)
+    def setWorkEndText(self, text):
+        self.work.setText(text)
+        if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')):
+            self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')))))
 
     def _check_files(self, _):
         self.item_list._openFileSource()
@@ -830,22 +1102,35 @@ class QualityScaler(QMainWindow):
         def _backText():
             time.sleep(3)
             self.work_number.setText("Hi :)")
-        if len(self.item_list.files_path) != 0:
-            remove_file(app_name + ".log")
-            if self._user_check_data():
-                self.work_number.setText('Loading...')
-                if "x2" in self.selected_AI_Model :
-                    upscale_factor = 2
-                elif "x4" in self.selected_AI_Model :
-                    upscale_factor = 4
-                backend = torch.device(torch_directml.device(int(self.selected_GPU)))
-                self.work.setText('STOP')
-                if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'stop_icon.png')):
-                    self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'stop_icon.png')))))
-                concurrent.futures.ThreadPoolExecutor(os.cpu_count() * 999999999999999).submit(self.upscale_orchestrator, backend, upscale_factor)
+        if self.work.text() == 'STOP':
+            self.process.task_signal = True
+            self.work.setText("UPSCALE")
+            if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')):
+                self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')))))
         else:
-            self.work_number.setText("No File Selected!")
-            threading.Thread(target=_backText, daemon=True).start()
+            if self.process is not None:
+                if self.process.isFinished():
+                    self.process = None
+            if len(self.item_list.files_path) != 0 and self.process is None:
+                if self._user_check_data():
+                    self.work_number.setText('Loading...')
+                    if "x2" in self.selected_AI_Model :
+                        upscale_factor = 2
+                    elif "x4" in self.selected_AI_Model :
+                        upscale_factor = 4
+                    backend = torch.device(torch_directml.device(int(self.selected_GPU)))
+                    self.work.setText('STOP')
+                    if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'stop_icon.png')):
+                        self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'stop_icon.png')))))
+                    self.process = Upscale(self.cpu_of_number_count, self.selected_AI_Model, self.item_list.files_path, self.selected_output_Format, self.vram_number, self.target_resize)
+                    self.process.setPriority(QThread.Priority.HighestPriority)
+                    self.process.text.connect(self.setWorkText)
+                    self.process.work_end_text.connect(self.setWorkEndText)
+                    self.process._init(backend, upscale_factor)
+                    self.process.start()
+            else:
+                self.work_number.setText("No File Selected!")
+                threading.Thread(target=_backText, daemon=True).start()
 
     def _user_check_data(self):
         try:
@@ -882,247 +1167,6 @@ class QualityScaler(QMainWindow):
 
         return True
 
-    def upscale_orchestrator(self, backend, upscale_factor):
-        def _backTitle():
-            time.sleep(4)
-            self.work_number.setText('Hi :)')
-        start = timer()
-        torch.set_num_threads(self.cpu_of_number_count)
-        try:
-            AI_model = prepare_model(self.selected_AI_Model, backend, half_precision, upscale_factor)
-
-            for index in range(len(self.item_list.files_path)):
-                self.work_number.setText("Upscaling " + str(index + 1) + "/" + str(len(self.item_list.files_path)))
-                file_path = self.item_list.files_path[index]
-                file_path = file_path.replace(os.path.dirname(self.item_list.files_path[index]), '{}_upscaled'.format(os.path.dirname(self.item_list.files_path[index])))
-                os.makedirs('{}_upscaled'.format(os.path.dirname(self.item_list.files_path[index])), exist_ok=True)
-                shutil.copy(self.item_list.files_path[index], '{}_upscaled'.format(os.path.dirname(self.item_list.files_path[index])))
-                if check_if_file_is_video(file_path):
-                    self.upscale_video(file_path,
-                                  AI_model,
-                                  self.selected_AI_Model,
-                                  upscale_factor,
-                                  backend,
-                                  self.selected_output_Format,
-                                  self.vram_number,
-                                  self.target_resize,
-                                  self.cpu_of_number_count,
-                                  half_precision)
-                else:
-                    self.upscale_image(file_path,
-                                  AI_model,
-                                  self.selected_AI_Model,
-                                  upscale_factor,
-                                  backend,
-                                  self.selected_output_Format,
-                                  self.vram_number,
-                                  self.target_resize,
-                                  self.cpu_of_number_count,
-                                  half_precision)
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-
-            self.work_number.setText("All files completed (" + str(round(timer() - start)) + " sec.)")
-            self.work.setText("UPSCALE")
-            if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')):
-                self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')))))
-            threading.Thread(target=_backTitle, daemon=True).start()
-
-        except Exception as exception:
-            self.work_number.setText('Error while upscaling' + '\n\n' + str(exception))
-            show_error(exception)
-
-    def upscale_video(self, video_path,
-                      AI_model,
-                      selected_AI_model,
-                      upscale_factor,
-                      backend,
-                      selected_output_file_extension,
-                      tiles_resolution,
-                      resize_factor,
-                      cpu_number,
-                      half_precision):
-
-        create_temp_dir(app_name + "_temp")
-
-        self.work_number.setText("Extracting video frames")
-        frame_list = extract_frames_from_video(video_path)
-
-        if resize_factor != 1:
-            self.work_number.setText("Resizing video frames")
-            frame_list = resize_frame_list(frame_list,
-                                           resize_factor,
-                                           selected_output_file_extension,
-                                           cpu_number)
-
-        self.upscale_video_and_save(video_path,
-                               frame_list,
-                               AI_model,
-                               tiles_resolution,
-                               selected_AI_model,
-                               backend,
-                               resize_factor,
-                               selected_output_file_extension,
-                               half_precision,
-                               cpu_number)
-
-    def upscale_video_and_save(self, video_path,
-                               frame_list,
-                               AI_model,
-                               tiles_resolution,
-                               selected_AI_model,
-                               backend,
-                               resize_factor,
-                               selected_output_file_extension,
-                               half_precision,
-                               cpu_number):
-
-        self.work_number.setText("Upscaling video")
-        frames_upscaled_list = []
-        need_tiles, n_tiles = video_need_tiles(frame_list[0], tiles_resolution)
-
-        # Prepare upscaled frames file paths
-        for frame in frame_list:
-            result_path = prepare_output_image_filename(frame, selected_AI_model, resize_factor,
-                                                        selected_output_file_extension)
-            frames_upscaled_list.append(result_path)
-
-        if need_tiles:
-            self.work_number.setText("Tiling frames...")
-            tiles_to_upscale, list_of_tiles_list = split_frames_list_in_tiles(frame_list, n_tiles, cpu_number)
-            how_many_tiles = len(tiles_to_upscale)
-
-            for index in range(how_many_tiles):
-                self.upscale_tiles(tiles_to_upscale[index],
-                              AI_model,
-                              backend,
-                              half_precision)
-                if (index % 8) == 0: self.work_number.setText(
-                    "Upscaled tiles " + str(index + 1) + "/" + str(how_many_tiles))
-
-            self.work_number.setText("Reconstructing frames by tiles...")
-            reverse_split_multiple_frames(list_of_tiles_list, frames_upscaled_list, n_tiles, cpu_number)
-
-        else:
-            how_many_frames = len(frame_list)
-
-            for index in range(how_many_frames):
-                self.upscale_single_frame(frame_list[index],
-                                     AI_model,
-                                     frames_upscaled_list[index],
-                                     backend,
-                                     half_precision)
-                if (index % 8) == 0: self.work_number.setText(
-                    "Upscaled frames " + str(index + 1) + "/" + str(how_many_frames))
-
-        # Reconstruct the video with upscaled frames
-        self.work_number.setText("Processing upscaled video")
-        video_reconstruction_by_frames(video_path, frames_upscaled_list,
-                                       selected_AI_model,
-                                       resize_factor, cpu_number)
-
-    def upscale_tiles(self, tile, AI_model, backend, half_precision):
-        with torch.no_grad():
-            tile_adapted = image_read(tile, cv2.IMREAD_UNCHANGED)
-            tile_upscaled = AI_enhance(AI_model, tile_adapted, backend, half_precision)
-            image_write(tile, tile_upscaled)
-
-    def upscale_single_frame(self, frame, AI_model, result_path, backend, half_precision):
-        with torch.no_grad():
-            img_adapted = image_read(frame, cv2.IMREAD_UNCHANGED)
-            img_upscaled = AI_enhance(AI_model, img_adapted, backend, half_precision)
-            image_write(result_path, img_upscaled)
-
-    def upscale_image(self, image_path,
-                      AI_model,
-                      selected_AI_model,
-                      upscale_factor,
-                      backend,
-                      selected_output_file_extension,
-                      tiles_resolution,
-                      resize_factor,
-                      cpu_number,
-                      half_precision):
-
-        # if image need resize before AI work
-        if resize_factor != 1:
-            image_path = resize_image(image_path,
-                                      resize_factor,
-                                      selected_output_file_extension)
-
-        result_path = prepare_output_image_filename(image_path, selected_AI_model, resize_factor,
-                                                    selected_output_file_extension)
-        self.upscale_image_and_save(image_path,
-                               AI_model,
-                               result_path,
-                               tiles_resolution,
-                               upscale_factor,
-                               backend,
-                               half_precision)
-
-        # if the image was sized before the AI work
-        if resize_factor != 1: remove_file(image_path)
-
-    def upscale_image_and_save(self, image,
-                               AI_model,
-                               result_path,
-                               tiles_resolution,
-                               upscale_factor,
-                               backend,
-                               half_precision):
-
-        need_tiles, n_tiles = self.image_need_tiles(image, tiles_resolution)
-        if need_tiles:
-            split_image(image_path=image,
-                        rows=n_tiles,
-                        cols=n_tiles,
-                        should_cleanup=False,
-                        output_dir=os.path.dirname(os.path.abspath(image)))
-
-            tiles_list = get_tiles_paths_after_split(image, n_tiles, n_tiles)
-
-            with torch.no_grad():
-                for tile in tiles_list:
-                    tile_adapted = image_read(tile, cv2.IMREAD_UNCHANGED)
-                    tile_upscaled = AI_enhance(AI_model, tile_adapted, backend, half_precision)
-                    image_write(tile, tile_upscaled)
-
-            reverse_split(paths_to_merge=tiles_list,
-                          rows=n_tiles,
-                          cols=n_tiles,
-                          image_path=result_path,
-                          should_cleanup=False)
-
-            self.delete_list_of_files(tiles_list)
-        else:
-            with torch.no_grad():
-                img_adapted = image_read(image, cv2.IMREAD_UNCHANGED)
-                img_upscaled = AI_enhance(AI_model, img_adapted, backend, half_precision)
-                image_write(result_path, img_upscaled)
-
-    def delete_list_of_files(self, list_to_delete):
-        if len(list_to_delete) > 0:
-            for to_delete in list_to_delete:
-                if os.path.exists(to_delete):
-                    os.remove(to_delete)
-
-    def image_need_tiles(self, image, tiles_resolution):
-        img_tmp = image_read(image)
-        image_pixels = (img_tmp.shape[1] * img_tmp.shape[0])
-        tile_pixels = (tiles_resolution * tiles_resolution)
-
-        n_tiles = image_pixels / tile_pixels
-
-        if n_tiles <= 1:
-            return False, 0
-        else:
-            if (n_tiles % 2) != 0: n_tiles += 1
-            n_tiles = round(sqrt(n_tiles * multiplier_num_tiles))
-
-            return True, n_tiles
-
     def open_github(self, _):
         webbrowser.open(githubme, new=1)
 
@@ -1138,4 +1182,5 @@ def main():
     wind.show()
     app.exec()
 
-main()
+if __name__ == '__main__':
+    main()
