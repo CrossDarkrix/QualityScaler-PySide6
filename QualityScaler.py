@@ -1167,10 +1167,7 @@ class QualityScaler(QMainWindow):
             if os.path.exists(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')):
                 self.work.setIcon(QIcon(QPixmap(QSize(24, 24)).fromImage(QImage(os.path.join(os.getcwd(), 'Assets', 'upscale_icon.png')))))
         else:
-            if self.process is not None:
-                if self.process.isFinished():
-                    self.process = None
-            if len(self.item_list.files_path) != 0 and self.process is None:
+            if len(self.item_list.files_path) != 0:
                 if self._user_check_data():
                     self.work_number.setText('Loading...')
                     if "x2" in self.selected_AI_Model:
