@@ -2,6 +2,7 @@ import concurrent.futures
 import functools
 import io
 import itertools
+import multiprocessing
 import os
 import pathlib
 import platform
@@ -593,38 +594,39 @@ def resize_image(image_path, resize_factor, selected_output_file_extension):
     image_write(new_image_path, resized_image)
     return new_image_path
 
-class Upscale(QThread):
-    text = Signal(str)
-    work_end_text = Signal(str)
-    def __init__(self, cpu_of_number_count,
+class _Upscale(object):
+    def __init__(self,
+                 q,
+                 end_q,
+                 cpu_of_number_count,
                  selected_AI_Model,
                  files_path,
                  selected_output_Format,
                  vram_number,
                  target_resize,
-                 parent=None):
-        super().__init__(parent)
+                 backend,
+                 upscale_factor,
+                 work_signal):
+        self.q = q
+        self.end_q = end_q
         self.cpu_of_number_count = cpu_of_number_count
         self.selected_AI_Model = selected_AI_Model
-        self.upscale_factor = None
         self.files_path = files_path
         self.selected_output_Format = selected_output_Format
         self.vram_number = vram_number
         self.target_resize = target_resize
-        self.backend = None
-        self.task = None
-        self.task_signal = False
+        self.backend = backend
+        self.upscale_factor = upscale_factor
+        self.work_signal = work_signal
 
     def upscale_orchestrator(self):
         start = timer()
         torch.set_num_threads(self.cpu_of_number_count)
-        if self.backend is not None and self.upscale_factor is not None:
+        if self.backend is not None:
             try:
                 AI_model = prepare_model(self.selected_AI_Model, self.backend, half_precision, self.upscale_factor)
                 for index in range(len(self.files_path)):
-                    if self.task_signal:
-                        break
-                    self.text.emit("Upscaling " + str(index + 1) + "/" + str(len(self.files_path)))
+                    self.q.put("Upscaling " + str(index + 1) + "/" + str(len(self.files_path)))
                     file_path = self.files_path[index]
                     file_path = file_path.replace(os.path.dirname(self.files_path[index]), '{}_upscaled'.format(os.path.dirname(self.files_path[index])))
                     os.makedirs('{}_upscaled'.format(os.path.dirname(self.files_path[index])), exist_ok=True)
@@ -633,48 +635,45 @@ class Upscale(QThread):
                         self.upscale_video(file_path,
                                       AI_model,
                                       self.selected_AI_Model,
-                                      self.upscale_factor,
                                       self.backend,
                                       self.selected_output_Format,
                                       self.vram_number,
                                       self.target_resize,
                                       self.cpu_of_number_count,
-                                      half_precision)
+                                      half_precision,
+                                      self.q)
                     else:
                         self.upscale_image(file_path,
                                       AI_model,
                                       self.selected_AI_Model,
-                                      self.upscale_factor,
                                       self.backend,
                                       self.selected_output_Format,
                                       self.vram_number,
                                       self.target_resize,
-                                      self.cpu_of_number_count,
                                       half_precision)
                     try:
                         os.remove(file_path)
                     except:
                         pass
 
-                self.text.emit("All files completed (" + str(round(timer() - start)) + " sec.)")
-                self.work_end_text.emit("UPSCALE")
+                self.q.put("All files completed (" + str(round(timer() - start)) + " sec.)")
+                self.end_q.put("UPSCALE")
                 time.sleep(4)
-                self.text.emit('Hi :)')
+                self.q.put('Hi :)')
             except Exception:
-                self.text.emit("All files completed (" + str(round(timer() - start)) + " sec.)")
-                self.work_end_text.emit("UPSCALE")
+                self.q.put("All files completed (" + str(round(timer() - start)) + " sec.)")
+                self.end_q.put("UPSCALE")
                 time.sleep(4)
-                self.text.emit('Hi :)')
+                self.q.put('Hi :)')
+        self.work_signal.put(True)
 
     def upscale_image(self, image_path,
                       AI_model,
                       selected_AI_model,
-                      upscale_factor,
                       backend,
                       selected_output_file_extension,
                       tiles_resolution,
                       resize_factor,
-                      cpu_number,
                       half_precision):
 
         # if image need resize before AI work
@@ -689,7 +688,6 @@ class Upscale(QThread):
                                AI_model,
                                result_path,
                                tiles_resolution,
-                               upscale_factor,
                                backend,
                                half_precision)
 
@@ -700,7 +698,6 @@ class Upscale(QThread):
                                AI_model,
                                result_path,
                                tiles_resolution,
-                               upscale_factor,
                                backend,
                                half_precision):
 
@@ -757,21 +754,21 @@ class Upscale(QThread):
     def upscale_video(self, video_path,
                       AI_model,
                       selected_AI_model,
-                      upscale_factor,
                       backend,
                       selected_output_file_extension,
                       tiles_resolution,
                       resize_factor,
                       cpu_number,
-                      half_precision):
+                      half_precision,
+                      q):
 
         create_temp_dir(app_name + "_temp")
 
-        self.text.emit("Extracting video frames")
+        q.put("Extracting video frames")
         frame_list = extract_frames_from_video(video_path)
 
         if resize_factor != 1:
-            self.text.emit("Resizing video frames")
+            q.put("Resizing video frames")
             frame_list = resize_frame_list(frame_list,
                                            resize_factor,
                                            selected_output_file_extension,
@@ -786,7 +783,8 @@ class Upscale(QThread):
                                resize_factor,
                                selected_output_file_extension,
                                half_precision,
-                               cpu_number)
+                               cpu_number,
+                               q)
 
     def upscale_video_and_save(self, video_path,
                                frame_list,
@@ -797,9 +795,10 @@ class Upscale(QThread):
                                resize_factor,
                                selected_output_file_extension,
                                half_precision,
-                               cpu_number):
+                               cpu_number,
+                               q):
 
-        self.text.emit("Upscaling video")
+        q.put("Upscaling video")
         frames_upscaled_list = []
         need_tiles, n_tiles = video_need_tiles(frame_list[0], tiles_resolution)
 
@@ -810,7 +809,7 @@ class Upscale(QThread):
             frames_upscaled_list.append(result_path)
 
         if need_tiles:
-            self.text.emit("Tiling frames...")
+            q.put("Tiling frames...")
             tiles_to_upscale, list_of_tiles_list = split_frames_list_in_tiles(frame_list, n_tiles, cpu_number)
             how_many_tiles = len(tiles_to_upscale)
 
@@ -819,10 +818,10 @@ class Upscale(QThread):
                               AI_model,
                               backend,
                               half_precision)
-                if (index % 8) == 0: self.text.emit(
+                if (index % 8) == 0: q.put(
                     "Upscaled tiles " + str(index + 1) + "/" + str(how_many_tiles))
 
-            self.text.emit("Reconstructing frames by tiles...")
+            q.put("Reconstructing frames by tiles...")
             reverse_split_multiple_frames(list_of_tiles_list, frames_upscaled_list, n_tiles, cpu_number)
 
         else:
@@ -834,11 +833,11 @@ class Upscale(QThread):
                                      frames_upscaled_list[index],
                                      backend,
                                      half_precision)
-                if (index % 8) == 0: self.text.emit(
+                if (index % 8) == 0: q.put(
                     "Upscaled frames " + str(index + 1) + "/" + str(how_many_frames))
 
         # Reconstruct the video with upscaled frames
-        self.text.emit("Processing upscaled video")
+        q.put("Processing upscaled video")
         video_reconstruction_by_frames(video_path, frames_upscaled_list,
                                        selected_AI_model,
                                        resize_factor, cpu_number)
@@ -855,14 +854,74 @@ class Upscale(QThread):
             img_upscaled = AI_enhance(AI_model, img_adapted, backend, half_precision)
             image_write(result_path, img_upscaled)
 
+    def run(self):
+        concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() * 9999999999999).submit(self.upscale_orchestrator).result()
+
+class Upscale(QThread):
+    text = Signal(str)
+    work_end_text = Signal(str)
+    def __init__(self, cpu_of_number_count,
+                 selected_AI_Model,
+                 files_path,
+                 selected_output_Format,
+                 vram_number,
+                 target_resize,
+                 parent=None):
+        super().__init__(parent)
+        self.cpu_of_number_count = cpu_of_number_count
+        self.selected_AI_Model = selected_AI_Model
+        self.files_path = files_path
+        self.selected_output_Format = selected_output_Format
+        self.vram_number = vram_number
+        self.target_resize = target_resize
+        self.backend = None
+        self.task = None
+        self.queue = None
+        self.end_queue = None
+        self.task_signal = False
+        self.work_signal = None
+        self.process = None
+
     def _init(self, backend, upscale_factor):
         self.backend = backend
         self.upscale_factor = upscale_factor
 
-    def run(self):
-        p = concurrent.futures.ThreadPoolExecutor(os.cpu_count() * 999999999999999)
-        p.submit(self.upscale_orchestrator).result()
+    def emitData(self):
+        while True:
+            if not self.end_queue.empty():
+                self.work_end_text.emit(self.end_queue.get())
+            if not self.queue.empty():
+                self.text.emit(self.queue.get())
+            if self.task_signal:
+                self.process.terminate()
+                self.work_end_text.emit("UPSCALE")
+                self.text.emit('Hi :)')
+                break
+            if not self.work_signal is not None:
+                if self.work_signal.get():
+                    break
 
+    def run(self):
+        queue = multiprocessing.SimpleQueue()
+        end_queue = multiprocessing.SimpleQueue()
+        work_signal = multiprocessing.SimpleQueue()
+        _ScaleUp = _Upscale(queue,
+                            end_queue,
+                            self.cpu_of_number_count,
+                            self.selected_AI_Model,
+                            self.files_path,
+                            self.selected_output_Format,
+                            self.vram_number,
+                            self.target_resize,
+                            self.backend,
+                            self.upscale_factor,
+                            work_signal)
+        self.process = multiprocessing.Process(target=_ScaleUp.run, daemon=True)
+        self.queue = queue
+        self.end_queue = end_queue
+        self.work_signal = work_signal
+        self.process.start()
+        self.emitData()
 
 class QualityScaler(QMainWindow):
     def __init__(self):
@@ -1114,9 +1173,9 @@ class QualityScaler(QMainWindow):
             if len(self.item_list.files_path) != 0 and self.process is None:
                 if self._user_check_data():
                     self.work_number.setText('Loading...')
-                    if "x2" in self.selected_AI_Model :
+                    if "x2" in self.selected_AI_Model:
                         upscale_factor = 2
-                    elif "x4" in self.selected_AI_Model :
+                    elif "x4" in self.selected_AI_Model:
                         upscale_factor = 4
                     backend = torch.device(torch_directml.device(int(self.selected_GPU)))
                     self.work.setText('STOP')
